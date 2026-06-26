@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -202,7 +203,6 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 		NodeID:              req.NodeID,
 		HostIP:              req.HostIP,
 		GRPCPort:            req.GRPCPort,
-		LabelsJSON:          mustJSON(req.Labels),
 		CapacityJSON:        mustJSON(req.Capacity),
 		AllocatableJSON:     mustJSON(req.Allocatable),
 		InstanceType:        req.InstanceType,
@@ -212,14 +212,39 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 		CreateConcurrentNum: req.CreateConcurrentNum,
 		MaxMvmNum:           req.MaxMvmNum,
 	}
-	if err := global.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "node_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"host_ip", "grpc_port", "labels_json", "capacity_json", "allocatable_json",
-			"instance_type", "cluster_label", "quota_cpu", "quota_mem_mb",
-			"create_concurrent_num", "max_mvm_num", "updated_at",
-		}),
-	}).Create(reg).Error; err != nil {
+	// Read existing labels from DB, merge cubelet labels (cubelet wins on conflict),
+	// then write back the merged result. Use SELECT ... FOR UPDATE inside a
+	// transaction to prevent concurrent admin label writes from being lost.
+	var mergedLabels map[string]string
+	if err := global.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "node_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"host_ip", "grpc_port", "capacity_json", "allocatable_json",
+				"instance_type", "cluster_label", "quota_cpu", "quota_mem_mb",
+				"create_concurrent_num", "max_mvm_num", "updated_at",
+			}),
+		}).Create(reg).Error; err != nil {
+			return err
+		}
+		existing, err := readLabelsJSONForUpdate(tx, req.NodeID)
+		if err != nil {
+			return err
+		}
+		for k, v := range req.Labels {
+			existing[k] = v
+		}
+		if len(existing) > maxLabelsPerNode {
+			return fmt.Errorf("a node cannot have more than %d labels, got %d after merge", maxLabelsPerNode, len(existing))
+		}
+		if err := tx.Table(constants.NodeMetaRegistrationTable).
+			Where("node_id = ?", req.NodeID).
+			Update("labels_json", mustJSON(existing)).Error; err != nil {
+			return err
+		}
+		mergedLabels = existing
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -228,7 +253,7 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 	snap.NodeID = req.NodeID
 	snap.HostIP = req.HostIP
 	snap.GRPCPort = req.GRPCPort
-	snap.Labels = cloneStringMap(req.Labels)
+	snap.Labels = cloneStringMap(mergedLabels)
 	snap.Capacity = req.Capacity
 	snap.Allocatable = req.Allocatable
 	snap.InstanceType = req.InstanceType
@@ -523,6 +548,225 @@ func ListSchedulerNodes(ctx context.Context) ([]*node.Node, error) {
 		out = append(out, toSchedulerNode(snap))
 	}
 	return out, nil
+}
+
+type UpdateNodeLabelsRequest struct {
+	Labels map[string]string `json:"labels"`
+}
+
+func UpdateNodeLabels(ctx context.Context, nodeID string, labels map[string]string) error {
+	if nodeID == "" {
+		return fmt.Errorf("node_id is required")
+	}
+	if err := validateNodeLabels(labels); err != nil {
+		return err
+	}
+	var nodeLabels map[string]string
+	if err := global.db.Transaction(func(tx *gorm.DB) error {
+		existing, err := readLabelsJSONForUpdate(tx, nodeID)
+		if err != nil {
+			return err
+		}
+		for k, v := range labels {
+			existing[k] = v
+		}
+		if len(existing) > maxLabelsPerNode {
+			return fmt.Errorf("a node cannot have more than %d labels, got %d after merge", maxLabelsPerNode, len(existing))
+		}
+		if err := tx.Table(constants.NodeMetaRegistrationTable).
+			Where("node_id = ?", nodeID).
+			Updates(map[string]interface{}{
+				"labels_json": mustJSON(existing),
+				"updated_at":  time.Now(),
+			}).Error; err != nil {
+			return err
+		}
+		nodeLabels = existing
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	snap := global.ensureNode(nodeID)
+	global.mu.Lock()
+	snap.Labels = cloneStringMap(nodeLabels)
+	global.mu.Unlock()
+	syncLocalcache(snap)
+	return nil
+}
+
+func DeleteNodeLabel(ctx context.Context, nodeID, key string) error {
+	if nodeID == "" {
+		return fmt.Errorf("node_id is required")
+	}
+	if err := validateNodeLabelKey(key); err != nil {
+		return err
+	}
+	var nodeLabels map[string]string
+	if err := global.db.Transaction(func(tx *gorm.DB) error {
+		existing, err := readLabelsJSONForUpdate(tx, nodeID)
+		if err != nil {
+			return err
+		}
+		delete(existing, key)
+		if err := tx.Table(constants.NodeMetaRegistrationTable).
+			Where("node_id = ?", nodeID).
+			Updates(map[string]interface{}{
+				"labels_json": mustJSON(existing),
+				"updated_at":  time.Now(),
+			}).Error; err != nil {
+			return err
+		}
+		nodeLabels = existing
+		return nil
+	}); err != nil {
+		return err
+	}
+	snap := global.ensureNode(nodeID)
+	global.mu.Lock()
+	snap.Labels = cloneStringMap(nodeLabels)
+	global.mu.Unlock()
+	syncLocalcache(snap)
+	return nil
+}
+
+// readLabelsJSONForUpdate reads the labels_json column with a row-level lock
+// (SELECT ... FOR UPDATE) inside an ongoing transaction, preventing concurrent
+// read-modify-write races on the same node's labels.
+func readLabelsJSONForUpdate(tx *gorm.DB, nodeID string) (map[string]string, error) {
+	var reg models.NodeRegistration
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Table(constants.NodeMetaRegistrationTable).
+		Where("node_id = ?", nodeID).
+		Take(&reg).Error; err != nil {
+		return nil, err
+	}
+	return parseLabelsJSON(reg.LabelsJSON)
+}
+
+func parseLabelsJSON(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]string{}, nil
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return map[string]string{}, nil
+	}
+	return m, nil
+}
+
+// Label validation follows Kubernetes conventions.
+// See: k8s.io/apimachinery/pkg/util/validation, k8s.io/apimachinery/pkg/api/validate/content
+//
+// Key format:   [prefix/]name
+//   - prefix: optional, DNS1123 subdomain (lowercase alphanumeric, '-' or '.', max 253)
+//   - name:   required, qualified name (alphanumeric, '-' '_' or '.', max 63, must start/end with alphanumeric)
+//
+// Value format: empty string or qualified name (same constraints as name, max 63)
+
+const (
+	qualifiedNameMaxLength    = 63
+	dns1123SubdomainMaxLength = 253
+
+	// Matches a qualified name: alphanumeric, '-', '_', '.', must start and end with alphanumeric.
+	qualifiedNameFmt = `([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]`
+
+	qualifiedNameErrMsg = `a qualified name must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character`
+
+	// Matches a DNS1123 subdomain: lowercase alphanumeric, '-' or '.', segments separated by '.'.
+	dns1123SubdomainFmt = `[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*`
+
+	dns1123SubdomainErrMsg = `a DNS-1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character`
+
+	maxLabelsPerNode = 64
+)
+
+var (
+	qualifiedNameRegexp    = regexp.MustCompile(`^` + qualifiedNameFmt + `$`)
+	dns1123SubdomainRegexp = regexp.MustCompile(`^` + dns1123SubdomainFmt + `$`)
+)
+
+func validateNodeLabels(labels map[string]string) error {
+	if len(labels) > maxLabelsPerNode {
+		return fmt.Errorf("label update request cannot contain more than %d labels, got %d", maxLabelsPerNode, len(labels))
+	}
+	for k, v := range labels {
+		if err := validateNodeLabelKey(k); err != nil {
+			return err
+		}
+		if errs := isValidLabelValue(v); len(errs) != 0 {
+			return fmt.Errorf("label value for key %q is invalid: %s", k, strings.Join(errs, ", "))
+		}
+	}
+	return nil
+}
+
+func validateNodeLabelKey(key string) error {
+	if errs := isQualifiedLabelKey(key); len(errs) != 0 {
+		return fmt.Errorf("label key %q is invalid: %s", key, strings.Join(errs, ", "))
+	}
+	return nil
+}
+
+// isQualifiedLabelKey validates a label key, matching K8s IsQualifiedName logic.
+// Returns a list of error strings if invalid, empty list if valid.
+func isQualifiedLabelKey(key string) []string {
+	var errs []string
+
+	if key == "" {
+		return append(errs, "must not be empty")
+	}
+	if config.IsReservedLabelKey(key) {
+		return append(errs, "is reserved for system use")
+	}
+
+	parts := strings.Split(key, "/")
+	var name string
+	switch len(parts) {
+	case 1:
+		name = parts[0]
+	case 2:
+		prefix := parts[0]
+		name = parts[1]
+		if prefix == "" {
+			errs = append(errs, "prefix part must not be empty")
+		} else if len(prefix) > dns1123SubdomainMaxLength {
+			errs = append(errs, fmt.Sprintf("prefix part must be no more than %d characters", dns1123SubdomainMaxLength))
+		} else if !dns1123SubdomainRegexp.MatchString(prefix) {
+			errs = append(errs, "prefix part "+dns1123SubdomainErrMsg)
+		}
+	default:
+		return append(errs, "must be in the form prefix/name or name (e.g. 'MyName' or 'example.com/MyName')")
+	}
+
+	if name == "" {
+		errs = append(errs, "name part must not be empty")
+	} else if len(name) > qualifiedNameMaxLength {
+		errs = append(errs, fmt.Sprintf("name part must be no more than %d characters", qualifiedNameMaxLength))
+	} else if !qualifiedNameRegexp.MatchString(name) {
+		errs = append(errs, "name part "+qualifiedNameErrMsg)
+	}
+
+	return errs
+}
+
+// isValidLabelValue validates a label value, matching K8s IsValidLabelValue logic.
+// Returns a list of error strings if invalid, empty list if valid.
+func isValidLabelValue(value string) []string {
+	var errs []string
+	if value == "" {
+		return errs
+	}
+	if len(value) > qualifiedNameMaxLength {
+		errs = append(errs, fmt.Sprintf("must be no more than %d characters", qualifiedNameMaxLength))
+	}
+	if !qualifiedNameRegexp.MatchString(value) {
+		errs = append(errs, qualifiedNameErrMsg)
+	}
+	return errs
 }
 
 func (s *service) ensureNode(nodeID string) *NodeSnapshot {
