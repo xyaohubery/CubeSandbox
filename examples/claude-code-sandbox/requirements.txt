@@ -1,0 +1,6 @@
+# CubeSandbox MCP Server for Claude Code
+# -----------------------------------------
+# Install with: pip install -r requirements.txt
+
+cubesandbox>=0.3.0
+mcp>=1.0.0

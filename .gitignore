@@ -51,3 +51,7 @@ __pycache__
 /tests
 
 web/tsconfig.tsbuildinfo
+
+# WSL artifacts (do not commit)
+WSLUbuntu/
+WSLubuntu.tar

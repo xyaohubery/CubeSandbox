@@ -48,3 +48,5 @@ lang: en-US
 | Title | Author | Date | Tags |
 | --- | --- | --- | --- |
 | [Pi Agent Integration Guide](./pi-agent.md) | chaojixinren | 2026-07-01 | integration, pi-agent, coding-agent, agent |
+| [Claude Code Integration Guide](claude-code.md) | community | 2026-07-01 | integration, claude-code, mcp |
+| _Add your article here_ | - | - | - |
