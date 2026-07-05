@@ -108,8 +108,7 @@ cp .env.example .env
       "args": ["/绝对路径/CubeSandbox/examples/claude-code-sandbox/mcp_server.py"],
       "env": {
         "CUBE_TEMPLATE_ID": "<your-template-id>",
-        "E2B_API_URL": "http://<cube-host>:3000",
-        "E2B_API_KEY": "e2b_000000"
+        "CUBE_API_URL": "http://<cube-host>:3000"
       }
     }
   }
@@ -303,7 +302,7 @@ sb = Sandbox.create(
 | 现象                                              | 可能原因              | 解决方案                                                                                 |
 |---------------------------------------------------|----------------------|-----------------------------------------------------------------------------------------|
 | MCP Server 无法启动                                | 缺少依赖              | 执行 `pip install -r requirements.txt`；检查 Python 3.10+                                |
-| `sandbox_create` 挂起                             | CubeAPI 不可达        | 检查 `E2B_API_URL`；`curl http://<host>:3000/health`                                     |
+| `sandbox_create` 挂起                             | CubeAPI 不可达        | 检查 `CUBE_API_URL`；`curl http://<host>:3000/health`                                     |
 | `sandbox_create` 返回 404                         | 模板 ID 错误          | 核对 `CUBE_TEMPLATE_ID`；执行 `cubemastercli tpl list`                                   |
 | `sandbox_run_code` 返回 502                       | 沙箱被驱逐（超时/被删） | 增加 `timeout`；检查沙箱是否被空闲超时机制终止                                              |
 | `sandbox_run_code` 返回 "connection refused"      | Jupyter 网关未就绪     | 模板必须暴露端口 49999；首次 `run_code` 调用前等待 2–3 秒                                   |

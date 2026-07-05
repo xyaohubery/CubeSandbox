@@ -58,8 +58,7 @@ cp .env.example .env
 
 | 变量                  | 说明                                                           |
 |-----------------------|---------------------------------------------------------------|
-| `E2B_API_URL`         | CubeAPI 地址，如 `http://<cube-host>:3000`                    |
-| `E2B_API_KEY`         | CubeAPI 认证密钥（本地/测试部署可用任意占位符，如 `e2b_000000`） |
+| `CUBE_API_URL`         | CubeAPI 地址，如 `http://<cube-host>:3000`                    |
 | `CUBE_TEMPLATE_ID`    | 沙箱模板 ID                                                    |
 | `CUBE_SSL_CERT_FILE`  | （可选）CubeSandbox CA 证书路径，用于 HTTPS 连接                  |
 
@@ -70,7 +69,7 @@ cp .env.example .env
 ```bash
 cubemastercli tpl create-from-image \
   --image cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
-  --writable-layer-size 1G \
+  --writable-layer-size 2G \
   --expose-port 49999 \
   --expose-port 49983 \
   --probe 49999
@@ -92,8 +91,7 @@ cubemastercli tpl create-from-image \
       "args": ["/path/to/cube-sandbox/examples/claude-code-sandbox/mcp_server.py"],
       "env": {
         "CUBE_TEMPLATE_ID": "<your-template-id>",
-        "E2B_API_URL": "http://<cube-host>:3000",
-        "E2B_API_KEY": "e2b_000000"
+        "CUBE_API_URL": "http://<cube-host>:3000"
       }
     }
   }
@@ -243,7 +241,7 @@ Claude Code 会按步骤调用沙箱工具并报告结果。
 
 | 现象                                          | 可能原因             | 解决方案                                                                         |
 |-----------------------------------------------|---------------------|---------------------------------------------------------------------------------|
-| `sandbox_create` 返回 "Connection refused"      | CubeAPI 不可达       | 检查 `E2B_API_URL`；确认 CubeAPI 正在运行（`curl http://host:3000/health`）       |
+| `sandbox_create` 返回 "Connection refused"      | CubeAPI 不可达       | 检查 `CUBE_API_URL`；确认 CubeAPI 正在运行（`curl http://host:3000/health`）       |
 | `sandbox_run_code` 卡住                         | Jupyter 网关未就绪    | 创建沙箱后等待几秒；模板需暴露 49999 端口                                           |
 | `sandbox_run_command` 返回 "not found"          | 工具未安装在模板中    | 用 `sandbox_run_command` 执行 `apt install` 或 `pip install`                      |
 | "Template not found"                            | `CUBE_TEMPLATE_ID` 错误或缺失 | 执行 `cubemastercli tpl list` 核对 ID                                          |

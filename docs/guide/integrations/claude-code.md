@@ -114,8 +114,7 @@ Add the MCP server entry to your Claude Code settings:
       "args": ["/absolute/path/to/CubeSandbox/examples/claude-code-sandbox/mcp_server.py"],
       "env": {
         "CUBE_TEMPLATE_ID": "<your-template-id>",
-        "E2B_API_URL": "http://<cube-host>:3000",
-        "E2B_API_KEY": "e2b_000000"
+        "CUBE_API_URL": "http://<cube-host>:3000"
       }
     }
   }
@@ -323,7 +322,7 @@ to provide input and sandbox_read_file to retrieve output.
 | Symptom                                         | Likely Cause                        | Fix                                                                                     |
 |-------------------------------------------------|-------------------------------------|-----------------------------------------------------------------------------------------|
 | MCP server fails to start                       | Missing dependencies                | Run `pip install -r requirements.txt`; check Python 3.10+                               |
-| `sandbox_create` hangs                          | CubeAPI unreachable                 | Verify `E2B_API_URL`; `curl http://<host>:3000/health`                                   |
+| `sandbox_create` hangs                          | CubeAPI unreachable                 | Verify `CUBE_API_URL`; `curl http://<host>:3000/health`                                   |
 | `sandbox_create` returns 404                    | Wrong template ID                   | Check `CUBE_TEMPLATE_ID`; run `cubemastercli tpl list`                                  |
 | `sandbox_run_code` returns 502                  | Sandbox evicted (timeout/deleted)   | Increase `timeout`; check that sandbox isn't being killed by idle timeout               |
 | `sandbox_run_code` returns "connection refused" | Jupyter gateway not ready           | Template must expose port 49999; wait 2-3s after create before first `run_code` call    |

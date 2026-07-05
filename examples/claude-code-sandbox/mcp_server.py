@@ -2,7 +2,7 @@
 
 Exposes CubeSandbox sandbox operations as MCP tools so Claude Code can
 safely execute code, run shell commands, and manage files inside
-hardware-isolated MicroVMs — all through natural language.
+hardware-isolated MicroVMs.
 
 Architecture::
 
@@ -13,34 +13,28 @@ Usage::
 
     pip install -r requirements.txt
     # Then configure Claude Code settings.json to point to this script.
-    # See README.md for the full setup flow.
 
-Environment variables (required)::
+Environment variables::
 
-    CUBE_TEMPLATE_ID  — sandbox template ID
-    E2B_API_URL       — CubeAPI endpoint, e.g. http://<host>:3000
-    E2B_API_KEY       — CubeAPI auth key (any string for local deploys)
+    CUBE_API_URL       — CubeAPI endpoint (default: http://127.0.0.1:3000)
+    CUBE_TEMPLATE_ID   — sandbox template ID
     CUBE_SSL_CERT_FILE — optional, path to CA bundle for cube HTTPS
 
 Status:
-    This MCP Server has been reviewed against the CubeSandbox v0.4.0 /
-    v0.5.0 Python SDK source and is believed to be correct, but has not
+    This MCP Server has been reviewed against the CubeSandbox v0.5.0
+    Python SDK source and is believed to be API-correct, but has not
     been tested end-to-end against a running CubeSandbox deployment.
-    Feedback and bug reports are welcome.
 """
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import os
+import signal
+import sys
 from pathlib import Path
 from typing import Any
-
-# ---------------------------------------------------------------------------
-# Optional SSL patch for CubeSandbox HTTPS
-# ---------------------------------------------------------------------------
-_ssl_cert = os.environ.get("CUBE_SSL_CERT_FILE")
-if _ssl_cert and Path(_ssl_cert).is_file():
-    os.environ["SSL_CERT_FILE"] = _ssl_cert
 
 # ---------------------------------------------------------------------------
 # SDK import
@@ -48,9 +42,7 @@ if _ssl_cert and Path(_ssl_cert).is_file():
 try:
     from cubesandbox import Sandbox
 except ImportError:
-    raise SystemExit(
-        "cubesandbox is not installed. Run: pip install cubesandbox"
-    )
+    raise SystemExit("cubesandbox is not installed. Run: pip install cubesandbox")
 
 try:
     from mcp.server import Server, NotificationOptions
@@ -60,9 +52,26 @@ except ImportError:
     raise SystemExit("mcp is not installed. Run: pip install mcp")
 
 # ---------------------------------------------------------------------------
-# Global sandbox reference (one per MCP session)
+# Per-session state (guarded by _lock)
 # ---------------------------------------------------------------------------
 _sandbox: Sandbox | None = None
+_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Shutdown — kill sandbox on exit / SIGTERM / SIGINT
+# ---------------------------------------------------------------------------
+def _cleanup() -> None:
+    """Best-effort sandbox kill on process exit."""
+    sb = _sandbox
+    if sb is not None:
+        try:
+            sb.kill()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup)
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -70,7 +79,6 @@ _sandbox: Sandbox | None = None
 
 def _validate_int(name: str, value: object, default: int, *,
                   min_val: int = 1, max_val: int = 86_400) -> int:
-    """Coerce *value* to int, falling back to *default* on failure."""
     if value is None:
         return default
     try:
@@ -88,7 +96,6 @@ def _validate_int(name: str, value: object, default: int, *,
 
 def _validate_float(name: str, value: object, default: float, *,
                     min_val: float = 1.0, max_val: float = 3_600.0) -> float:
-    """Coerce *value* to float, falling back to *default* on failure."""
     if value is None:
         return default
     try:
@@ -105,16 +112,33 @@ def _validate_float(name: str, value: object, default: float, *,
 
 
 def _require_str(name: str, value: object) -> str:
-    """Require *value* to be a non-empty string."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
-            f"{name} must be a non-empty string, got {type(value).__name__}: {value!r}"
+            f"{name} must be a non-empty string, "
+            f"got {type(value).__name__}: {value!r}"
         )
     return value.strip()
 
 
+def _sanitize_path(path: str) -> str:
+    """Reject path traversal and absolute paths outside sandbox workspace."""
+    p = Path(path)
+    if ".." in p.parts:
+        raise ValueError(f"Path traversal not allowed: {path!r}")
+    return str(p)
+
+
+def _sanitize_error(exc: BaseException) -> str:
+    """Return a user-safe error message — no stack traces or internal URLs."""
+    msg = str(exc).strip()
+    # Truncate long messages (e.g. HTML error pages)
+    if len(msg) > 500:
+        msg = msg[:500] + "..."
+    return msg
+
+
 # ---------------------------------------------------------------------------
-# MCP Server setup
+# MCP Server
 # ---------------------------------------------------------------------------
 server = Server("cube-sandbox")
 
@@ -154,8 +178,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Execute Python code inside the sandbox via a persistent "
                 "Jupyter kernel. Variables, imports, and DataFrames persist "
-                "across calls within the same sandbox session. Use for data "
-                "analysis, computation, plotting, or any Python work. "
+                "across calls within the same sandbox session. "
                 "For plain shell commands, use sandbox_run_command instead."
             ),
             inputSchema={
@@ -166,7 +189,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Python source code to execute.",
                     },
                     "timeout": {
-                        "type": "integer",
+                        "type": "number",
                         "description": "Execution timeout in seconds (default: 120, min: 1, max: 3600).",
                     },
                 },
@@ -200,7 +223,6 @@ async def list_tools() -> list[Tool]:
             name="sandbox_read_file",
             description=(
                 "Read the contents of a file from the sandbox. "
-                "Use to retrieve generated output, logs, or plot images. "
                 "Output is truncated at 50,000 characters."
             ),
             inputSchema={
@@ -208,7 +230,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path inside the sandbox.",
+                        "description": "Relative path inside the sandbox workspace.",
                     },
                 },
                 "required": ["path"],
@@ -218,15 +240,14 @@ async def list_tools() -> list[Tool]:
             name="sandbox_write_file",
             description=(
                 "Write content to a file inside the sandbox. "
-                "Use to provide input data, scripts, or configuration files "
-                "that subsequent run_code / run_command calls will use."
+                "Subsequent run_code / run_command calls can use the file."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Target path inside the sandbox.",
+                        "description": "Relative path inside the sandbox workspace.",
                     },
                     "content": {
                         "type": "string",
@@ -240,8 +261,7 @@ async def list_tools() -> list[Tool]:
             name="sandbox_get_info",
             description=(
                 "Retrieve sandbox metadata: ID, state, CPU/memory, uptime, "
-                "template ID. Useful for checking whether a sandbox is still "
-                "running or for debugging connectivity issues."
+                "template ID. Useful for debugging connectivity issues."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -250,9 +270,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Create a point-in-time snapshot of the sandbox, preserving "
                 "the complete filesystem and memory state. The snapshot "
-                "survives sandbox destruction and can be used later to "
-                "clone or rollback. Useful for saving long-running "
-                "work before a pause or as a checkpoint."
+                "survives sandbox destruction and can be used to clone or "
+                "rollback later."
             ),
             inputSchema={
                 "type": "object",
@@ -269,9 +288,8 @@ async def list_tools() -> list[Tool]:
             name="sandbox_pause",
             description=(
                 "Pause the sandbox, preserving its memory snapshot. "
-                "The sandbox can be resumed later via a new sandbox_create "
-                "pointing to the snapshot. Use to save work and release "
-                "compute resources between sessions."
+                "The snapshot survives independently and can be accessed "
+                "via snapshot management tools after the sandbox is paused."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -288,7 +306,7 @@ async def list_tools() -> list[Tool]:
 
 
 # ---------------------------------------------------------------------------
-# Tool handler
+# Tool handler  (all SDK calls go through asyncio.to_thread)
 # ---------------------------------------------------------------------------
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -296,34 +314,39 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     # ---- sandbox_create ------------------------------------------------
     if name == "sandbox_create":
-        if _sandbox is not None:
-            return [_text("⚠️ A sandbox is already active. Destroy it first.")]
+        async with _lock:
+            if _sandbox is not None:
+                return [_text("⚠️ A sandbox is already active. Destroy it first.")]
 
-        template = arguments.get("template") or os.environ.get("CUBE_TEMPLATE_ID")
-        if not template:
-            return [_text("❌ Missing template. Set CUBE_TEMPLATE_ID or pass template=.")]
+            template = arguments.get("template") or os.environ.get("CUBE_TEMPLATE_ID")
+            if not template:
+                return [_text("❌ Missing template. Set CUBE_TEMPLATE_ID or pass template=.")]
 
-        try:
-            timeout = _validate_int("timeout", arguments.get("timeout"), 600,
-                                   min_val=30, max_val=86_400)
-        except ValueError as exc:
-            return [_text(f"❌ Invalid argument: {exc}")]
+            try:
+                timeout = _validate_int("timeout", arguments.get("timeout"), 600,
+                                        min_val=30, max_val=86_400)
+            except ValueError as exc:
+                return [_text(f"❌ Invalid argument: {exc}")]
 
-        try:
-            _sandbox = Sandbox.create(template=template, timeout=timeout)
-        except Exception as exc:
-            return [_text(f"❌ Failed to create sandbox: {exc}")]
+            try:
+                _sandbox = await asyncio.to_thread(
+                    Sandbox.create, template=template, timeout=timeout
+                )
+            except Exception as exc:
+                return [_text(f"❌ Failed to create sandbox: {_sanitize_error(exc)}")]
 
-        return [_text(
-            f"✅ Sandbox created.\n"
-            f"   ID:       {_sandbox.sandbox_id}\n"
-            f"   Template: {_sandbox.template_id}\n"
-            f"   State:    running\n"
-            f"   Timeout:  {timeout}s"
-        )]
+            return [_text(
+                f"✅ Sandbox created.\n"
+                f"   ID:       {_sandbox.sandbox_id}\n"
+                f"   Template: {_sandbox.template_id}\n"
+                f"   State:    running\n"
+                f"   Timeout:  {timeout}s"
+            )]
 
     # ---- guard: sandbox must exist -------------------------------------
-    if _sandbox is None:
+    async with _lock:
+        sb = _sandbox
+    if sb is None:
         return [_text("❌ No active sandbox. Call sandbox_create first.")]
 
     # ---- sandbox_run_code ----------------------------------------------
@@ -340,42 +363,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [_text(f"❌ Invalid argument: {exc}")]
 
         try:
-            execution = _sandbox.run_code(code, timeout=timeout_val)
+            execution = await asyncio.to_thread(sb.run_code, code, timeout=timeout_val)
         except Exception as exc:
-            return [_text(f"❌ Code execution failed: {exc}")]
+            return [_text(f"❌ Code execution failed: {_sanitize_error(exc)}")]
 
         parts: list[str] = []
-        # Safely extract structured output — each field is BestEffort.
-        # On unexpected types we splice a short warning into the output
-        # so callers can see that something went wrong, but the partial
-        # result is still returned for debugging.
-        try:
-            if execution.logs and execution.logs.stdout:
-                stdout_text = "".join(execution.logs.stdout).strip()
-                if stdout_text:
-                    parts.append(stdout_text)
-        except Exception as _exc:
-            parts.append(f"[mcp: error reading stdout: {_exc}]")
-        try:
-            if execution.logs and execution.logs.stderr:
-                stderr_text = "".join(execution.logs.stderr).strip()
-                if stderr_text:
-                    parts.append(f"[stderr]\n{stderr_text}")
-        except Exception as _exc:
-            parts.append(f"[mcp: error reading stderr: {_exc}]")
-        try:
-            if execution.error:
-                parts.append(
-                    f"❌ {execution.error.name}: {execution.error.value}\n"
-                    f"{execution.error.traceback[:2000] if execution.error.traceback else ''}"
-                )
-        except Exception as _exc:
-            parts.append(f"[mcp: error reading execution.error: {_exc}]")
-        try:
-            if execution.text and execution.text.strip():
-                parts.append(execution.text.strip())
-        except Exception as _exc:
-            parts.append(f"[mcp: error reading execution.text: {_exc}]")
+        stdout_text = "".join(execution.logs.stdout).strip()
+        if stdout_text:
+            parts.append(stdout_text)
+        stderr_text = "".join(execution.logs.stderr).strip()
+        if stderr_text:
+            parts.append(f"[stderr]\n{stderr_text}")
+        if execution.error:
+            parts.append(
+                f"❌ {execution.error.name}: {execution.error.value}\n"
+                f"{execution.error.traceback[:2000] if execution.error.traceback else ''}"
+            )
+        if execution.text and execution.text.strip():
+            parts.append(execution.text.strip())
 
         if not parts:
             return [_text("(executed, no output)")]
@@ -395,9 +400,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [_text(f"❌ Invalid argument: {exc}")]
 
         try:
-            result = _sandbox.commands.run(command, timeout=timeout_val)
+            result = await asyncio.to_thread(
+                sb.commands.run, command, timeout=timeout_val
+            )
         except Exception as exc:
-            return [_text(f"❌ Command failed: {exc}")]
+            return [_text(f"❌ Command failed: {_sanitize_error(exc)}")]
 
         output = ""
         if result.stdout:
@@ -415,15 +422,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "sandbox_read_file":
         try:
             path = _require_str("path", arguments.get("path"))
+            path = _sanitize_path(path)
         except ValueError as exc:
             return [_text(f"❌ Invalid argument: {exc}")]
 
         try:
-            content = _sandbox.files.read(path)
+            content = await asyncio.to_thread(sb.files.read, path)
         except Exception as exc:
-            return [_text(f"❌ Failed to read {path!r}: {exc}")]
+            return [_text(f"❌ Failed to read {path!r}: {_sanitize_error(exc)}")]
 
-        # Guard against non-string returns (defensive — SDK returns str)
         if not isinstance(content, str):
             content = str(content)
 
@@ -439,20 +446,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "sandbox_write_file":
         try:
             path = _require_str("path", arguments.get("path"))
+            path = _sanitize_path(path)
             file_content = _require_str("content", arguments.get("content"))
         except ValueError as exc:
             return [_text(f"❌ Invalid argument: {exc}")]
 
         try:
-            _sandbox.files.write(path, file_content.encode("utf-8"))
+            await asyncio.to_thread(
+                sb.files.write, path, file_content.encode("utf-8")
+            )
             return [_text(f"✅ Written {len(file_content):,d} bytes to {path!r}")]
         except Exception as exc:
-            return [_text(f"❌ Failed to write {path!r}: {exc}")]
+            return [_text(f"❌ Failed to write {path!r}: {_sanitize_error(exc)}")]
 
     # ---- sandbox_get_info ----------------------------------------------
     if name == "sandbox_get_info":
         try:
-            info = _sandbox.get_info()
+            info = await asyncio.to_thread(sb.get_info)
             lines = []
             for k in ("sandboxID", "templateID", "state", "cpuCount",
                        "memoryMB", "startedAt"):
@@ -460,23 +470,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if v is not None:
                     lines.append(f"  {k}: {v}")
             if not lines:
-                return [_text(f"(info returned, but no recognised keys in: {sorted(info.keys())!r})")]
+                return [_text(
+                    f"(info returned, no recognised keys in: "
+                    f"{sorted(info.keys())!r})"
+                )]
             return [_text("\n".join(lines))]
         except Exception as exc:
-            return [_text(f"❌ Failed to get info: {exc}")]
+            return [_text(f"❌ Failed to get info: {_sanitize_error(exc)}")]
 
     # ---- sandbox_snapshot ----------------------------------------------
     if name == "sandbox_snapshot":
-        # Explicit None check to avoid falsy string trap:
-        # "0", "False", empty string are all valid snapshot names in the API.
         snap_name = arguments.get("name")
         if snap_name is not None and not isinstance(snap_name, str):
-            return [_text(f"❌ snapshot 'name' must be a string, got {type(snap_name).__name__}")]
+            return [_text(
+                f"❌ snapshot 'name' must be a string, "
+                f"got {type(snap_name).__name__}"
+            )]
         if snap_name is not None and not snap_name.strip():
-            snap_name = None  # Treat empty/whitespace-only as "no name"
+            snap_name = None
+
         try:
-            snap = _sandbox.create_snapshot(name=snap_name)
-            # SnapshotInfo.names is list[str]
+            snap = await asyncio.to_thread(sb.create_snapshot, name=snap_name)
             names_str = ", ".join(snap.names) if snap.names else "(none)"
             return [_text(
                 f"✅ Snapshot created.\n"
@@ -484,32 +498,35 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 f"   Names: {names_str}"
             )]
         except Exception as exc:
-            return [_text(f"❌ Snapshot failed: {exc}")]
+            return [_text(f"❌ Snapshot failed: {_sanitize_error(exc)}")]
 
     # ---- sandbox_pause -------------------------------------------------
     if name == "sandbox_pause":
         try:
-            _sandbox.pause()
+            await asyncio.to_thread(sb.pause)
             return [_text(
-                "✅ Sandbox paused. Use sandbox_create with the same "
-                "sandbox ID to resume."
+                "✅ Sandbox paused. A snapshot was created and will be "
+                "accessible via snapshot management. Destroying this "
+                "sandbox will not delete the snapshot."
             )]
         except Exception as exc:
-            return [_text(f"❌ Pause failed: {exc}")]
+            return [_text(f"❌ Pause failed: {_sanitize_error(exc)}")]
 
     # ---- sandbox_destroy -----------------------------------------------
     if name == "sandbox_destroy":
+        sid = "<unknown>"
         try:
-            sid = _sandbox.sandbox_id
+            sid = sb.sandbox_id
         except Exception:
-            sid = "<unknown>"
-        try:
-            _sandbox.kill()
-        except Exception as exc:
-            _sandbox = None
-            return [_text(f"⚠️ Destroy may have partially failed: {exc}")]
-        finally:
-            _sandbox = None
+            pass
+        async with _lock:
+            try:
+                _sandbox.kill()
+            except Exception as exc:
+                _sandbox = None
+                return [_text(f"⚠️ Destroy may have partially failed: {_sanitize_error(exc)}")]
+            finally:
+                _sandbox = None
         return [_text(f"✅ Sandbox {sid!r} destroyed.")]
 
     return [_text(f"❌ Unknown tool: {name!r}")]
@@ -525,7 +542,20 @@ def _text(content: str) -> TextContent:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-async def main() -> None:
+async def _main_async() -> None:
+    # Apply optional SSL patch inside main() to avoid import-time side effect.
+    ssl_cert = os.environ.get("CUBE_SSL_CERT_FILE")
+    if ssl_cert and Path(ssl_cert).is_file():
+        os.environ["SSL_CERT_FILE"] = ssl_cert
+
+    # Forward SIGTERM/SIGINT to asyncio for clean shutdown + atexit cleanup.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda: None)
+        except NotImplementedError:
+            pass  # Windows — signal handlers not supported on ProactorEventLoop
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -537,7 +567,9 @@ async def main() -> None:
         )
 
 
-if __name__ == "__main__":
-    import asyncio
+def main() -> None:
+    asyncio.run(_main_async())
 
-    asyncio.run(main())
+
+if __name__ == "__main__":
+    main()

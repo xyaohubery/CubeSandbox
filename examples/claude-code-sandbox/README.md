@@ -64,8 +64,7 @@ Edit `.env` and fill in your CubeSandbox connection details:
 
 | Variable             | Description                                                    |
 |----------------------|----------------------------------------------------------------|
-| `E2B_API_URL`        | CubeAPI endpoint, e.g. `http://<cube-host>:3000`              |
-| `E2B_API_KEY`        | CubeAPI auth key (`e2b_000000` for local/testing deployments)  |
+| `CUBE_API_URL`        | CubeAPI endpoint, e.g. `http://<cube-host>:3000`              |
 | `CUBE_TEMPLATE_ID`   | Template ID for your sandbox images                            |
 | `CUBE_SSL_CERT_FILE` | (Optional) Path to CubeSandbox CA bundle for HTTPS             |
 
@@ -76,7 +75,7 @@ If you don't have a template yet:
 ```bash
 cubemastercli tpl create-from-image \
   --image cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
-  --writable-layer-size 1G \
+  --writable-layer-size 2G \
   --expose-port 49999 \
   --expose-port 49983 \
   --probe 49999
@@ -96,8 +95,7 @@ Add this to your Claude Code settings:
       "args": ["/path/to/cube-sandbox/examples/claude-code-sandbox/mcp_server.py"],
       "env": {
         "CUBE_TEMPLATE_ID": "<your-template-id>",
-        "E2B_API_URL": "http://<cube-host>:3000",
-        "E2B_API_KEY": "e2b_000000"
+        "CUBE_API_URL": "http://<cube-host>:3000"
       }
     }
   }
@@ -263,7 +261,7 @@ sandbox lifecycle, concurrency, and error handling.
 
 | Symptom                                    | Likely Cause                        | Fix                                                                         |
 |--------------------------------------------|-------------------------------------|-----------------------------------------------------------------------------|
-| `sandbox_create` returns "Connection refused" | CubeAPI not reachable              | Check `E2B_API_URL`; ensure CubeAPI is running (`curl http://host:3000/health`) |
+| `sandbox_create` returns "Connection refused" | CubeAPI not reachable              | Check `CUBE_API_URL`; ensure CubeAPI is running (`curl http://host:3000/health`) |
 | `sandbox_run_code` hangs                   | Jupyter gateway not ready           | Wait a few seconds after create; template may need port 49999 exposed        |
 | `sandbox_run_command` returns "not found"  | Tool not installed in template      | Use `sandbox_run_command` with `apt install` or `pip install` as needed     |
 | "Template not found"                       | Wrong or missing `CUBE_TEMPLATE_ID`  | Run `cubemastercli tpl list` and verify the ID                               |
