@@ -314,15 +314,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         except Exception as exc:
             return [_text(f"❌ Failed to create sandbox: {exc}")]
 
-        try:
-            info = _sandbox.get_info()
-        except Exception:
-            info = {}
         return [_text(
             f"✅ Sandbox created.\n"
             f"   ID:       {_sandbox.sandbox_id}\n"
             f"   Template: {_sandbox.template_id}\n"
-            f"   State:    {info.get('state', 'unknown')}\n"
+            f"   State:    running\n"
             f"   Timeout:  {timeout}s"
         )]
 
@@ -349,33 +345,37 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [_text(f"❌ Code execution failed: {exc}")]
 
         parts: list[str] = []
+        # Safely extract structured output — each field is BestEffort.
+        # On unexpected types we splice a short warning into the output
+        # so callers can see that something went wrong, but the partial
+        # result is still returned for debugging.
         try:
             if execution.logs and execution.logs.stdout:
                 stdout_text = "".join(execution.logs.stdout).strip()
                 if stdout_text:
                     parts.append(stdout_text)
-        except Exception:
-            pass
+        except Exception as _exc:
+            parts.append(f"[mcp: error reading stdout: {_exc}]")
         try:
             if execution.logs and execution.logs.stderr:
                 stderr_text = "".join(execution.logs.stderr).strip()
                 if stderr_text:
                     parts.append(f"[stderr]\n{stderr_text}")
-        except Exception:
-            pass
+        except Exception as _exc:
+            parts.append(f"[mcp: error reading stderr: {_exc}]")
         try:
             if execution.error:
                 parts.append(
                     f"❌ {execution.error.name}: {execution.error.value}\n"
                     f"{execution.error.traceback[:2000] if execution.error.traceback else ''}"
                 )
-        except Exception:
-            pass
+        except Exception as _exc:
+            parts.append(f"[mcp: error reading execution.error: {_exc}]")
         try:
             if execution.text and execution.text.strip():
                 parts.append(execution.text.strip())
-        except Exception:
-            pass
+        except Exception as _exc:
+            parts.append(f"[mcp: error reading execution.text: {_exc}]")
 
         if not parts:
             return [_text("(executed, no output)")]
@@ -467,7 +467,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     # ---- sandbox_snapshot ----------------------------------------------
     if name == "sandbox_snapshot":
-        snap_name = arguments.get("name") or None
+        # Explicit None check to avoid falsy string trap:
+        # "0", "False", empty string are all valid snapshot names in the API.
+        snap_name = arguments.get("name")
+        if snap_name is not None and not isinstance(snap_name, str):
+            return [_text(f"❌ snapshot 'name' must be a string, got {type(snap_name).__name__}")]
+        if snap_name is not None and not snap_name.strip():
+            snap_name = None  # Treat empty/whitespace-only as "no name"
         try:
             snap = _sandbox.create_snapshot(name=snap_name)
             # SnapshotInfo.names is list[str]
