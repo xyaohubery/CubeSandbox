@@ -131,10 +131,13 @@ def _sanitize_path(path: str) -> str:
 
 
 def _sanitize_error(exc: BaseException) -> str:
-    """Truncate error messages to prevent context flooding.
-    Stack traces and internal URLs are not explicitly stripped — only
-    length-limited at 500 characters."""
+    """Return a user-safe error message — no URLs, IPs, or stack traces."""
+    import re as _re
     msg = str(exc).strip()
+    # Strip URLs
+    msg = _re.sub(r'https?://[^\s"]+', '<URL>', msg)
+    # Strip IP addresses
+    msg = _re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '<IP>', msg)
     if len(msg) > 500:
         msg = msg[:500] + "..."
     return msg
@@ -359,6 +362,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         except ValueError as exc:
             return [_text(f"❌ Invalid argument: {exc}")]
 
+        if len(code.encode("utf-8")) > 100_000:
+            return [_text(
+                f"❌ Code too large: {len(code):,d} chars "
+                f"(max 100,000). Split into smaller cells."
+            )]
+
         try:
             timeout_val = _validate_float("timeout", arguments.get("timeout"),
                                           120.0, min_val=1.0, max_val=3_600.0)
@@ -371,8 +380,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [_text(f"❌ Code execution failed: {_sanitize_error(exc)}")]
 
         parts: list[str] = []
-        stdout_text = "".join(execution.logs.stdout).strip()
-        if stdout_text:
+        if execution.logs is not None and execution.logs.stdout:
+            stdout_text = "".join(execution.logs.stdout).strip()
+            if stdout_text:
             parts.append(stdout_text)
         stderr_text = "".join(execution.logs.stderr).strip()
         if stderr_text:
@@ -551,11 +561,11 @@ async def _main_async() -> None:
     if ssl_cert and Path(ssl_cert).is_file():
         os.environ["SSL_CERT_FILE"] = ssl_cert
 
-    # Forward SIGTERM/SIGINT to asyncio for clean shutdown + atexit cleanup.
+    # Forward SIGTERM/SIGINT to trigger graceful shutdown via atexit.
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, lambda: None)
+            loop.add_signal_handler(sig, _cleanup)
         except NotImplementedError:
             pass  # Windows — signal handlers not supported on ProactorEventLoop
 
