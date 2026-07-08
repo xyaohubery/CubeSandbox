@@ -8,9 +8,7 @@ Ready-to-use Dockerfiles for common sandbox scenarios.
 |----------|-------------|------|
 | `python-data-science` | Python + pandas, numpy, matplotlib, scikit-learn | ~500MB |
 | `nodejs-server` | Node.js 22 + npm, yarn, pnpm | ~300MB |
-| `web-automation` | Python + Playwright + Chromium | ~1GB |
 | `go-dev` | Go 1.23 + common tools | ~400MB |
-| `rust-dev` | Rust toolchain + cargo | ~600MB |
 
 ## Usage
 
