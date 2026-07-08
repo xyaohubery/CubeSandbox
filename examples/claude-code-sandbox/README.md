@@ -271,5 +271,5 @@ sandbox lifecycle, concurrency, and error handling.
 
 - [CubeSandbox Claude Code Integration Guide](../../docs/guide/integrations/claude-code.md) — Full integration guide with best practices
 - [CubeSandbox Quick Start](https://cube-sandbox.pages.dev/guide/quickstart)
-- [CubeSandbox Python SDK](../sdk/python/README.md)
+- [CubeSandbox Python SDK](../../sdk/python/README.md)
 - [Claude Code MCP Documentation](https://docs.anthropic.com/en/docs/claude-code/mcp)
