@@ -121,17 +121,20 @@ def _require_str(name: str, value: object) -> str:
 
 
 def _sanitize_path(path: str) -> str:
-    """Reject path traversal and absolute paths outside sandbox workspace."""
+    """Reject path traversal and absolute paths."""
     p = Path(path)
+    if p.is_absolute():
+        raise ValueError(f"Absolute paths not allowed: {path!r}")
     if ".." in p.parts:
         raise ValueError(f"Path traversal not allowed: {path!r}")
     return str(p)
 
 
 def _sanitize_error(exc: BaseException) -> str:
-    """Return a user-safe error message — no stack traces or internal URLs."""
+    """Truncate error messages to prevent context flooding.
+    Stack traces and internal URLs are not explicitly stripped — only
+    length-limited at 500 characters."""
     msg = str(exc).strip()
-    # Truncate long messages (e.g. HTML error pages)
     if len(msg) > 500:
         msg = msg[:500] + "..."
     return msg
@@ -505,9 +508,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
             await asyncio.to_thread(sb.pause)
             return [_text(
-                "✅ Sandbox paused. A snapshot was created and will be "
-                "accessible via snapshot management. Destroying this "
-                "sandbox will not delete the snapshot."
+                "✅ Sandbox paused. State preserved. Use sandbox_snapshot "
+                "before pausing if you need an explicit snapshot for later "
+                "cloning or rollback."
             )]
         except Exception as exc:
             return [_text(f"❌ Pause failed: {_sanitize_error(exc)}")]
@@ -521,7 +524,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pass
         async with _lock:
             try:
-                _sandbox.kill()
+                sb.kill()
             except Exception as exc:
                 _sandbox = None
                 return [_text(f"⚠️ Destroy may have partially failed: {_sanitize_error(exc)}")]
