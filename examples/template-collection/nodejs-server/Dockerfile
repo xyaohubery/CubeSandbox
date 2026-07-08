@@ -8,5 +8,5 @@ RUN apt-get update && apt-get install -y ca-certificates curl gnupg && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && apt-get install -y nodejs && \
-    npm install -g npm@latest yarn pnpm && \
+    npm install -g npm@11.5.1 yarn@1.22.22 pnpm@10.15.1 && \
     rm -rf /var/lib/apt/lists/*
